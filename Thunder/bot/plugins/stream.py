@@ -3,9 +3,11 @@
 import asyncio
 import secrets
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit, quote, urlencode, parse_qsl
 
 from pyrogram import Client, enums, filters
 from pyrogram.errors import MessageNotModified, MessageDeleteForbidden
+from pyrogram.errors import ButtonUrlInvalid  # specific exception
 from pyrogram.types import (InlineKeyboardButton, InlineKeyboardMarkup,
                             LinkPreviewOptions, Message)
 
@@ -33,50 +35,111 @@ async def fwd_media(m_msg: Message) -> Optional[Message]:
         return None
 
 
-# --- Safe button + logging ---
-def safe_url(url: Optional[str]) -> Optional[str]:
-    if url and (url.startswith("http://") or url.startswith("https://")):
-        return url
-    return None
+# ------------------ URL SANITIZING & BUTTONS (robust) ------------------
 
-def get_link_buttons(links):
-    buttons = []
-    stream = safe_url(links.get("stream_link"))
-    download = safe_url(links.get("online_link"))
+def _sanitize_url(raw: Optional[str]) -> Optional[str]:
+    """
+    Make sure URL is http(s), has a host, is stripped, and percent-encodes spaces etc.
+    Returns a safe, reconstructed URL or None.
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+
+    # common cases returned by some shorteners without protocol
+    if s.startswith("t.me/") or s.startswith("telegram.me/") or s.startswith("telegram.dog/"):
+        s = "https://" + s
+
+    # reject non-http(s)
+    parts = urlsplit(s)
+    if parts.scheme not in ("http", "https"):
+        return None
+    if not parts.netloc:
+        return None
+    if any(c.isspace() for c in s):
+        # recompose with encoded path/query to remove spaces
+        path = quote(parts.path, safe="/%._-~")
+        query = urlencode(parse_qsl(parts.query, keep_blank_values=True), doseq=True)
+        s = urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+        parts = urlsplit(s)
+
+    # Telegram can still complain on weird chars; re-encode path & query always.
+    path = quote(parts.path, safe="/%._-~")
+    query = urlencode(parse_qsl(parts.query, keep_blank_values=True), doseq=True)
+    safe = urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+
+    # conservative length guard (Telegram buttons are picky)
+    if len(safe) > 1024:  # very generous cap
+        return None
+
+    return safe
+
+
+def get_link_buttons(links: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
+    stream = _sanitize_url(links.get("stream_link"))
+    download = _sanitize_url(links.get("online_link"))
 
     row = []
     if stream:
         row.append(InlineKeyboardButton(MSG_BUTTON_STREAM_NOW, url=stream))
     else:
-        logger.warning(f"⚠️ Invalid stream link: {links.get('stream_link')}")
+        bad = links.get("stream_link")
+        if bad:
+            logger.warning(f"Invalid stream_link for button: {bad}")
 
     if download:
         row.append(InlineKeyboardButton(MSG_BUTTON_DOWNLOAD, url=download))
     else:
-        logger.warning(f"⚠️ Invalid download link: {links.get('online_link')}")
+        bad = links.get("online_link")
+        if bad:
+            logger.warning(f"Invalid online_link for button: {bad}")
 
     if row:
         return InlineKeyboardMarkup([row])
     return None
 
 
-async def send_link(msg: Message, links: Dict[str, Any]):
-    reply_markup = get_link_buttons(links)
+async def _safe_send_with_buttons(func, *, text: str, reply_markup: Optional[InlineKeyboardMarkup], **kwargs):
+    """
+    Try sending with buttons. If Telegram rejects button URLs, resend without buttons.
+    """
+    try:
+        return await handle_flood_wait(func, text, reply_markup=reply_markup, **kwargs)
+    except ButtonUrlInvalid as e:
+        logger.error(f"ButtonUrlInvalid: {e}. Retrying without buttons.")
+        return await handle_flood_wait(func, text, reply_markup=None, **kwargs)
+    except Exception as e:
+        # Some other error with markup — fallback to no buttons
+        if "BUTTON_URL_INVALID" in str(e):
+            logger.error(f"Button error (generic): {e}. Retrying without buttons.")
+            return await handle_flood_wait(func, text, reply_markup=None, **kwargs)
+        raise
 
-    await handle_flood_wait(
+
+async def send_link(msg: Message, links: Dict[str, Any]):
+    body = MSG_LINKS.format(
+        file_name=links.get('media_name', 'Unknown'),
+        file_size=links.get('media_size', 'Unknown'),
+        download_link=links.get('online_link', 'N/A'),
+        stream_link=links.get('stream_link', 'N/A')
+    )
+    markup = get_link_buttons(links)
+
+    logger.info(f"Generated links: online={links.get('online_link')} | stream={links.get('stream_link')} | has_markup={bool(markup)}")
+
+    await _safe_send_with_buttons(
         msg.reply_text,
-        MSG_LINKS.format(
-            file_name=links.get('media_name', 'Unknown'),
-            file_size=links.get('media_size', 'Unknown'),
-            download_link=links.get('online_link', 'N/A'),
-            stream_link=links.get('stream_link', 'N/A')
-        ),
+        text=body,
         quote=True,
         parse_mode=enums.ParseMode.MARKDOWN,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=reply_markup if reply_markup else None
+        reply_markup=markup
     )
 
+
+# ------------------ COMMAND & HANDLERS ------------------
 
 @StreamBot.on_message(filters.command("link") & ~filters.private)
 async def link_handler(bot: Client, msg: Message, **kwargs):
@@ -108,6 +171,7 @@ async def link_handler(bot: Client, msg: Message, **kwargs):
     if not msg.reply_to_message.media:
         await reply_user_err(msg, MSG_ERROR_NO_FILE)
         return
+
     parts = msg.text.split()
     num_files = 1
     if len(parts) > 1:
@@ -119,8 +183,10 @@ async def link_handler(bot: Client, msg: Message, **kwargs):
         except ValueError:
             await reply_user_err(msg, MSG_ERROR_INVALID_NUMBER)
             return
+
     status_msg = await handle_flood_wait(msg.reply_text, MSG_PROCESSING_REQUEST, quote=True)
     shortener_val = kwargs.get('shortener', Var.SHORTEN_MEDIA_LINKS)
+
     if num_files == 1:
         await process_single(bot, msg, msg.reply_to_message, status_msg, shortener_val)
     else:
@@ -173,11 +239,11 @@ async def channel_receive_handler(bot: Client, msg: Message):
             return
         shortener_val = await get_shortener_status(bot, msg)
         links = await gen_links(stored_msg, shortener=shortener_val)
-        source_info = msg.chat.title or "Unknown Channel"
+
         await handle_flood_wait(
             stored_msg.reply_text,
             MSG_NEW_FILE_REQUEST.format(
-                source_info=source_info,
+                source_info=msg.chat.title or "Unknown Channel",
                 id_=msg.chat.id,
                 online_link=links.get('online_link', 'N/A'),
                 stream_link=links.get('stream_link', 'N/A')
@@ -185,8 +251,18 @@ async def channel_receive_handler(bot: Client, msg: Message):
             link_preview_options=LinkPreviewOptions(is_disabled=True),
             quote=True
         )
+
         try:
-            await handle_flood_wait(msg.edit_reply_markup, reply_markup=get_link_buttons(links))
+            # Try to add buttons to the original channel message
+            markup = get_link_buttons(links)
+            if markup:
+                await handle_flood_wait(msg.edit_reply_markup, reply_markup=markup)
+            else:
+                # Fallback: just send a new message with text/links
+                await send_link(msg, links)
+        except ButtonUrlInvalid as e:
+            logger.error(f"ButtonUrlInvalid while editing markup: {e}. Sending without buttons.")
+            await send_link(msg, links)
         except MessageNotModified:
             pass
         except MessageDeleteForbidden:
@@ -195,6 +271,7 @@ async def channel_receive_handler(bot: Client, msg: Message):
         except Exception as e:
             logger.error(f"Error editing reply markup for message {msg.id}: {e}", exc_info=True)
             await send_link(msg, links)
+
     except Exception as e:
         logger.error(f"Error in channel_receive_handler for message {msg.id}: {e}", exc_info=True)
 
@@ -205,41 +282,46 @@ async def process_single(bot: Client, msg: Message, file_msg: Message, status_ms
         if not stored_msg:
             logger.error(f"Failed to forward media for message {file_msg.id}. Skipping.")
             return None
+
         links = await gen_links(stored_msg, shortener=shortener_val)
-        logger.info(f"Generated links: {links}")  # Debugging log
+        logger.info(f"Generated links: {links}")
+
         if not original_request_msg:
             await send_link(msg, links)
+
         if msg.chat.type != enums.ChatType.PRIVATE and msg.from_user:
             try:
                 single_dm_text = MSG_DM_SINGLE_PREFIX.format(chat_title=msg.chat.title or "the chat") + "\n" + \
-                                MSG_LINKS.format(
-                                    file_name=links.get('media_name', 'Unknown'),
-                                    file_size=links.get('media_size', 'Unknown'),
-                                    download_link=links.get('online_link', 'N/A'),
-                                    stream_link=links.get('stream_link', 'N/A')
-                                )
-                await handle_flood_wait(
+                                 MSG_LINKS.format(
+                                     file_name=links.get('media_name', 'Unknown'),
+                                     file_size=links.get('media_size', 'Unknown'),
+                                     download_link=links.get('online_link', 'N/A'),
+                                     stream_link=links.get('stream_link', 'N/A')
+                                 )
+                markup = get_link_buttons(links)
+                await _safe_send_with_buttons(
                     bot.send_message,
-                    chat_id=msg.from_user.id,
                     text=single_dm_text,
+                    chat_id=msg.from_user.id,
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                     parse_mode=enums.ParseMode.MARKDOWN,
-                    reply_markup=get_link_buttons(links)
+                    reply_markup=markup
                 )
             except Exception as e:
                 logger.error(f"Error sending DM for single file: {e}", exc_info=True)
                 await reply_user_err(msg, MSG_ERROR_DM_FAILED)
+
+        # log to BIN thread
         source_msg = original_request_msg if original_request_msg else msg
         source_info = ""
         source_id = 0
         if source_msg.from_user:
-            source_info = source_msg.from_user.full_name
-            if not source_info:
-                source_info = f"@{source_msg.from_user.username}" if source_msg.from_user.username else "Unknown User"
+            source_info = source_msg.from_user.full_name or (f"@{source_msg.from_user.username}" if source_msg.from_user.username else "Unknown User")
             source_id = source_msg.from_user.id
         elif source_msg.chat.type == enums.ChatType.CHANNEL:
             source_info = source_msg.chat.title or "Unknown Channel"
             source_id = source_msg.chat.id
+
         if source_info and source_id:
             await handle_flood_wait(
                 stored_msg.reply_text,
@@ -252,6 +334,7 @@ async def process_single(bot: Client, msg: Message, file_msg: Message, status_ms
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                 quote=True
             )
+
         if status_msg:
             try:
                 await handle_flood_wait(status_msg.delete)
@@ -259,7 +342,9 @@ async def process_single(bot: Client, msg: Message, file_msg: Message, status_ms
                 logger.debug(f"Failed to delete status message {status_msg.id} due to permissions.")
             except Exception as e:
                 logger.error(f"Error deleting status message {status_msg.id}: {e}", exc_info=True)
+
         return links
+
     except Exception as e:
         logger.error(f"Error processing single file for message {file_msg.id}: {e}", exc_info=True)
         if status_msg:
@@ -271,7 +356,7 @@ async def process_single(bot: Client, msg: Message, file_msg: Message, status_ms
                 logger.debug(f"Failed to edit status message {status_msg.id} due to permissions.")
             except Exception as edit_err:
                 logger.error(f"Error editing status message {status_msg.id} after processing error: {edit_err}", exc_info=True)
-        
+
         await notify_own(bot, MSG_CRITICAL_ERROR.format(
             error=str(e),
             error_id=secrets.token_hex(6)
@@ -357,4 +442,4 @@ async def process_batch(bot: Client, msg: Message, start_id: int, count: int, st
             total=count,
             failed=failed
         )
-    )
+  )
